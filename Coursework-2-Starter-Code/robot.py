@@ -15,7 +15,7 @@ from collections import deque
 # Imports from this project
 # You should not import any other modules, including config.py
 # If you want to create some configuration parameters for your algorithm, keep them within this robot.py file
-from config import SAC_CONFIG
+# from config import RL_CONFIG
 import constants
 from graphics import VisualisationLine
 
@@ -24,172 +24,222 @@ plt.ion()
 
 # CONFIGURATION PARAMETERS. Add whatever configuration parameters you like here.
 # Remember, you will only be submitting this robot.py file, no other files.
-
-class Actor(nn.Module):
-    def __init__(self, hidden_dim=SAC_CONFIG['hidden_dim']):
-        super().__init__()
-        self.model = nn.Sequential(
-            nn.Linear(constants.OBSERVATION_DIMENSION, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
-        )
-        # Output: mean and log_std for action distribution
-        self.mean_layer = nn.Linear(hidden_dim, constants.ACTION_DIMENSION)
-        self.log_std_layer = nn.Linear(hidden_dim, constants.ACTION_DIMENSION)
-        
-    def forward(self, obs):
-        y = self.model(obs)
-        mean = self.mean_layer(y)
-        log_std = self.log_std_layer(y)
-        # Clip log_std for stability
-        log_std = torch.clamp(log_std, -2, 2)
-        std = log_std.exp()
-        z = torch.randn_like(mean)
-        action = mean + std * z
-        log_prob = (-0.5 * z.pow(2) - log_std).sum(dim=-1, keepdim=True)
-        return action, log_prob
-
-class Critic(nn.Module):
-    def __init__(self, hidden_dim=SAC_CONFIG['hidden_dim']):
-        super().__init__()
-        self.model = nn.Sequential(
-            nn.Linear(constants.OBSERVATION_DIMENSION+constants.ACTION_DIMENSION, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)  # Q-value output
-        )
-    
-    def forward(self, obs, action):
-        x = torch.cat([obs, action], dim=-1)
-        return self.model(x)
-
-class SoftActorCritic:
+RL_CONFIG = {
+    'demo_steps': 50,
+    'num_actions': 36,
+    'hidden_dim': 256,
+    'batch_size': 256,
+    'buffer_size': 65536,
+    "gamma": 0.98,           # discount factor
+    "epsilon": 0.5,          # exploration rate
+    "epsilon_min": 0.05,     # minimum exploration rate
+    "epsilon_decay": 0.99,  # decay rate for exploration
+    "learning_rate": 0.005,  
+    "target_update_freq": 10
+}
+class RLAlgorithm:
     def __init__(self):
-        self.replay_buffer = deque([], SAC_CONFIG['buffer_size'])
-        self.actor = Actor()
-        self.critics = (Critic(), Critic())
-        self.critic_targets = (Critic(), Critic())
-        for i in [0,1]:
-            self.critic_targets[i].load_state_dict(self.critics[i].state_dict())
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=SAC_CONFIG['lr_actor'])
-        self.critic_optimizers = [torch.optim.Adam(self.critics[i].parameters(), lr=SAC_CONFIG['lr_critic']) for i in [0,1]]
-        self.target_entropy = -constants.ACTION_DIMENSION
-        self.log_alpha = torch.zeros(1, 1, requires_grad=True)
-        self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=SAC_CONFIG['lr_critic'])
+        self.replay_buffer = deque([], RL_CONFIG['buffer_size'])
+        self.demo_buffer = deque([], RL_CONFIG['buffer_size'])
     
-    def replay_sample(self, batch_size=SAC_CONFIG['batch_size']):
-        batch = random.sample(self.replay_buffer, batch_size)
+    def replay_sample(self): 
+        if len(self.replay_buffer) < RL_CONFIG['buffer_size']:
+            batch = self.replay_buffer
+        else:
+            recent = int(RL_CONFIG['buffer_size']/3)
+            batch = self.replay_buffer[-recent:]
+            batch = random.sample(self.replay_buffer[:-recent], RL_CONFIG['buffer_size'] - recent) + batch
         return tuple(torch.stack(t) for t in zip(*batch))
     
-    def select_action(self, obs):
-        with torch.no_grad():
-            obs = torch.Tensor(obs).unsqueeze(0)
-            action, _ = self.actor.forward(obs)
-            return action.squeeze().numpy()
+    def behavior_cloning(self, epochs=400):
+        observations, actions = tuple(torch.stack(t) for t in zip(*self.demo_buffer))
+        dataset = torch.utils.data.TensorDataset(observations, actions)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=RL_CONFIG['batch_size'], shuffle=True)
+        print(actions)
+        for epoch in range(epochs):
+            for batch_obs, batch_actions in loader:
+                q_values = self.q_network(batch_obs)
+                demo = torch.zeros_like(q_values)
+                demo.scatter_(1, batch_actions.reshape(-1,1), 1.0)
+                loss = nn.CrossEntropyLoss()(q_values, demo)
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+        print("Pretraining completed with loss", loss)
 
-    def update(self, batch_size=SAC_CONFIG['batch_size']):
-        # Sample from replay buffer
-        obs, action, next_obs, reward, done = self.replay_sample(batch_size)
-        with torch.no_grad():
-            next_action, next_log_prob = self.actor.forward(next_obs)
-            target_Q = [self.critics[i](next_obs, next_action) for i in [0,1]]
-            target_Q = torch.min(*target_Q)
-            alpha = self.log_alpha.exp()
-            target_Q = reward + (1-done) * SAC_CONFIG['discount'] * (target_Q - alpha*next_log_prob)
+class DQN_Learning(RLAlgorithm):
+    def __init__(self):
+        super().__init__()
+        self.q_network = self._build_model()
+        self.target_network = self._build_model()
+        self.target_network.load_state_dict(self.q_network.state_dict())
+        self.optimizer = optim.Adam(self.q_network.parameters(), lr=RL_CONFIG['learning_rate'])
+        self.criterion = nn.CrossEntropyLoss()
+        self.epsilon = 0
+    @staticmethod
+    def _build_model():
+        """Builds a neural network model for Q-function approximation"""
+        hidden = RL_CONFIG['hidden_dim']
+        model = nn.Sequential(
+            nn.Linear(constants.OBSERVATION_DIMENSION, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, RL_CONFIG['num_actions']),
+            nn.Softmax(dim=1)
+        )
+        return model
+    def select_action(self, obs, raw=False):
+        """Select action using epsilon-greedy policy"""
+        if np.random.rand() <= self.epsilon:
+            return random.randrange(RL_CONFIG['num_actions'])
         
-        for i in [0,1]:
-            self.critic_optimizers[i].zero_grad()
-            critic_loss = F.mse_loss(self.critics[i](obs, action), target_Q)
-            critic_loss.backward()
-            self.critic_optimizers[i].step()
+        obs = torch.FloatTensor(obs).unsqueeze(0)
+        with torch.no_grad():
+            q_values = self.q_network(obs)
+        if raw:
+            return q_values
+        return q_values.argmax().item()
+    def decay_epsilon(self):
+        """Decay exploration rate"""
+        if self.epsilon > RL_CONFIG['epsilon_min']:
+            self.epsilon *= RL_CONFIG['epsilon_decay']
 
-        new_action, log_prob = self.actor.forward(obs)
-        Q = [self.critics[i](obs, new_action) for i in [0,1]]
-        Q = torch.min(*Q)
-        actor_loss = (alpha * log_prob - Q).mean()
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
-
-        alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
-        self.alpha_optimizer.zero_grad()
-        alpha_loss.backward()
-        self.alpha_optimizer.step()
-
-        for i in [0,1]:
-            for param, target_param in zip(self.critics[i].parameters(), self.critic_targets[i].parameters()):
-                tau = SAC_CONFIG['tau']
-                target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-
-
+    def update(self):
+        if not self.epsilon:
+            self.epsilon = RL_CONFIG['epsilon']
+        for _ in range(10):
+            obs, actions, next_obs, rewards, dones = self.replay_sample()
+            current_q_values = self.q_network(obs).gather(1, actions.unsqueeze(1)).squeeze(1)
+            # Compute target Q values
+            with torch.no_grad():
+                next_q_values = self.target_network(next_obs).max(1)[0]
+                target_q_values = rewards + (1 - dones) * RL_CONFIG['gamma'] * next_q_values
+            
+            # Compute loss and update weights
+            loss = self.criterion(current_q_values, target_q_values)
+            self.optimizer.zero_grad()
+            loss.backward()
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), max_norm=1.0)
+            self.optimizer.step()
+        self.decay_epsilon()
+        return loss.item()
+    
+    def update_target_network(self, episodes):
+        """Update target network at specified frequency"""
+        if episodes % RL_CONFIG['target_update_freq'] == 0:
+            self.target_network.load_state_dict(self.q_network.state_dict())
+    
 # The Robot class (which could be called "Agent") is the "brain" of the robot, and is used to decide what action to execute in the environment
 class Robot:
     # Initialise a new robot
     def __init__(self):
         # The environment (only available during development mode)
         self.environment = None
+        self.prev_state = None
+        self.prev_reward = None
         # A list of visualisations which will be displayed on the bottom half of the window
         self.visualisation_lines = []
-        self.brain = SoftActorCritic()
+        self.brain = DQN_Learning()
+        self.done = 0
         self.episode_steps = 0
-        self.prev_dist = None
+        self.demo_required = True
+    
+    @staticmethod
+    def action_to_vector(action):
+        h_actions = RL_CONFIG['num_actions']/2
+        rad = np.pi * (action - h_actions+1)/h_actions
+        dx = constants.MAX_ACTION_MAGNITUDE * np.cos(rad)
+        dy = constants.MAX_ACTION_MAGNITUDE * np.sin(rad)
+        return np.array([dx, dy])
+    @staticmethod
+    def vector_to_action(vector):
+        h_actions = RL_CONFIG['num_actions']/2
+        rad = np.arctan2(vector[1], vector[0])
+        action = np.ceil(h_actions * rad/np.pi + h_actions-1)
+        return torch.tensor(max(action, 0), dtype=torch.int64)
 
     # Get the next training action
     def training_action(self, obs, money):
-        action_value = np.zeros(constants.ACTION_DIMENSION)            
-        if self.episode_steps < SAC_CONFIG['init_steps']:
-            action_value = np.random.uniform(-constants.MAX_ACTION_MAGNITUDE, constants.MAX_ACTION_MAGNITUDE, 2)
+        if self.episode_steps > 800 or self.done:
+            # Episode done, reset or end
+            action_type = 2 if money > 20 else 4
+            print("Action type:", action_type)
+            self.brain.epsilon = RL_CONFIG['epsilon']
+            self.episode_steps = 0
+            self.prev_state = None
+            self.prev_reward = None
+            reset_state = np.array([0.05,np.random.uniform(0, constants.ENVIRONMENT_HEIGHT)])
+            self.done = 0
+            return action_type, reset_state
+        
+        action_value = []
+        if self.demo_required:
+            print("Collect expert demonstration")
+            return 3, np.array([0, RL_CONFIG['demo_steps']])
         else:
-            if self.episode_steps > 1500 or self.brain.replay_buffer[-1][4].numpy() == 1:
-                # Episode done, reset or end
-                action_type = 2 if money > constants.INIT_MONEY*0.7 else 4
-                print("Action type:", action_type)
-                self.episode_steps = 0
-                reset_state = np.array([0.05,np.random.uniform(0, constants.ENVIRONMENT_HEIGHT)])
-                return action_type, reset_state
-            elif len(self.brain.replay_buffer) > SAC_CONFIG['batch_size']:
-                # Update SAC model every n steps
-                if self.episode_steps % 100 == 0:
+            if len(self.brain.replay_buffer) > RL_CONFIG['demo_steps']:
+                self.brain.update()
+                self.brain.update_target_network(len(self.brain.replay_buffer))
+                if self.episode_steps % 50 == 0:
                     print(self.episode_steps, money)
-                for _ in range(50):
-                    self.brain.update()
-            action_value = self.brain.select_action(obs)
+            action_value = Robot.action_to_vector(self.brain.select_action(obs))
         return 1, action_value
-        # return 1, np.array([constants.MAX_ACTION_MAGNITUDE, 0])
 
     # Get the next testing action
     def testing_action(self, obs):
         # Random action
-        if self.episode_steps < SAC_CONFIG['init_steps']/4:
-            return np.random.uniform(-constants.MAX_ACTION_MAGNITUDE, constants.MAX_ACTION_MAGNITUDE, 2)
-        elif len(self.brain.replay_buffer) > SAC_CONFIG['batch_size']:
+        if len(self.brain.replay_buffer) > RL_CONFIG['batch_size']:
             self.brain.update()
         action = self.brain.select_action(obs)
-        return action
+        return Robot.action_to_vector(action)
 
     # Receive a transition
     def receive_transition(self, obs, action, next_obs, reward):
-        # Reward shaping
-        shaped_reward = 100/(1 - reward) - 40
-        # shaped_reward = -100*reward - 10
-        # shaped_reward = reward+1
-        done = 0
-        if reward >= -0.01 or (hasattr(self, "environment") and self.environment.state[0] >= 1.95):
-            done = 1
-        elif self.prev_dist is not None:
-            shaped_reward += 100*abs(reward-self.prev_dist) - 1
-        self.prev_dist = reward
+        shaped_reward = reward-5
+        if self.environment is not None:
+            if self.prev_state is not None:
+                x1, y1 = tuple(self.prev_state)
+                x2, y2 = tuple(self.environment.state)
+                real_action = np.clip(action, -constants.MAX_ACTION_MAGNITUDE, constants.MAX_ACTION_MAGNITUDE)
+                xd, yd = (self.environment.state + real_action * 5)
+                xr, yr = (self.environment.state - real_action * 5)
+                if len(self.visualisation_lines) >= 1:
+                    self.visualisation_lines.pop()
+                    self.visualisation_lines.pop()
+                self.visualisation_lines.extend([VisualisationLine(x1, y1, x2, y2, (100,0,200), 0.005),
+                    VisualisationLine(x2, y2, xd, yd, (20,200,50), 0.01),
+                    VisualisationLine(x2, y2, xr, yr, (200,20,50), 0.01)])
+            self.prev_state = self.environment.state
+            if self.environment.state[0] >= 1.95:
+                self.done = 1
+        elif reward >= -0.01:
+            self.done = 1
+            shaped_reward += 100
         self.episode_steps += 1
+        if self.prev_reward is not None and abs( reward - self.prev_reward ) < 1e-4:
+            shaped_reward -= 5
+        else:
+            for checkpoint in np.arange(-1.8, 0, -0.2):
+                if reward > checkpoint:
+                    shaped_reward += 1
+        self.prev_reward = reward
         self.brain.replay_buffer.append((torch.Tensor(obs), 
-                                         torch.Tensor(action),
+                                         Robot.vector_to_action(action),
                                          torch.Tensor(next_obs), 
-                                         torch.Tensor([shaped_reward]),
-                                         torch.Tensor([done])))
+                                         torch.tensor(shaped_reward),
+                                         torch.tensor(self.done)))
+        # if self.episode_steps % 400 == 0:
+        #     self.demo_required = True
     # Receive a new demonstration
     def receive_demo(self, demo):
-        pass
+        self.brain.demo_buffer.extend([
+            (torch.Tensor(obs), Robot.vector_to_action(action)) for obs, action in demo
+        ])
+        print("Demo received", len(demo), len(self.brain.demo_buffer))
+        self.brain.behavior_cloning()
+        self.demo_required = False     
 
 
 if __name__ == "__main__":
@@ -198,4 +248,4 @@ if __name__ == "__main__":
     # ys = 100/(1-xs)-40
     # plt.plot(xs, ys)
     # plt.savefig("function.png")
-    print(np.exp(2))
+    print(np.floor(-0.5))
