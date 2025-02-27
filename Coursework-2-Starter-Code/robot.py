@@ -15,7 +15,7 @@ from collections import deque
 # Imports from this project
 # You should not import any other modules, including config.py
 # If you want to create some configuration parameters for your algorithm, keep them within this robot.py file
-# from config import RL_CONFIG
+from config import RL_CONFIG
 import constants
 from graphics import VisualisationLine
 
@@ -24,19 +24,7 @@ plt.ion()
 
 # CONFIGURATION PARAMETERS. Add whatever configuration parameters you like here.
 # Remember, you will only be submitting this robot.py file, no other files.
-RL_CONFIG = {
-    'demo_steps': 50,
-    'num_actions': 36,
-    'hidden_dim': 256,
-    'batch_size': 256,
-    'buffer_size': 65536,
-    "gamma": 0.98,           # discount factor
-    "epsilon": 0.5,          # exploration rate
-    "epsilon_min": 0.05,     # minimum exploration rate
-    "epsilon_decay": 0.99,  # decay rate for exploration
-    "learning_rate": 0.005,  
-    "target_update_freq": 10
-}
+
 class RLAlgorithm:
     def __init__(self):
         self.replay_buffer = deque([], RL_CONFIG['buffer_size'])
@@ -46,38 +34,24 @@ class RLAlgorithm:
         if len(self.replay_buffer) < RL_CONFIG['buffer_size']:
             batch = self.replay_buffer
         else:
-            recent = int(RL_CONFIG['buffer_size']/3)
+            recent = int(RL_CONFIG['buffer_size']/4)
             batch = self.replay_buffer[-recent:]
             batch = random.sample(self.replay_buffer[:-recent], RL_CONFIG['buffer_size'] - recent) + batch
         return tuple(torch.stack(t) for t in zip(*batch))
-    
-    def behavior_cloning(self, epochs=400):
-        observations, actions = tuple(torch.stack(t) for t in zip(*self.demo_buffer))
-        dataset = torch.utils.data.TensorDataset(observations, actions)
-        loader = torch.utils.data.DataLoader(dataset, batch_size=RL_CONFIG['batch_size'], shuffle=True)
-        print(actions)
-        for epoch in range(epochs):
-            for batch_obs, batch_actions in loader:
-                q_values = self.q_network(batch_obs)
-                demo = torch.zeros_like(q_values)
-                demo.scatter_(1, batch_actions.reshape(-1,1), 1.0)
-                loss = nn.CrossEntropyLoss()(q_values, demo)
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
-        print("Pretraining completed with loss", loss)
+
 
 class DQN_Learning(RLAlgorithm):
     def __init__(self):
         super().__init__()
-        self.q_network = self._build_model()
-        self.target_network = self._build_model()
+        self.q_network = self._build_q_model()
+        self.d_network = self._build_dynamic_model()
+        self.target_network = self._build_q_model()
         self.target_network.load_state_dict(self.q_network.state_dict())
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=RL_CONFIG['learning_rate'])
         self.criterion = nn.CrossEntropyLoss()
         self.epsilon = 0
     @staticmethod
-    def _build_model():
+    def _build_q_model():
         """Builds a neural network model for Q-function approximation"""
         hidden = RL_CONFIG['hidden_dim']
         model = nn.Sequential(
@@ -86,29 +60,45 @@ class DQN_Learning(RLAlgorithm):
             nn.Linear(hidden, hidden),
             nn.ReLU(),
             nn.Linear(hidden, RL_CONFIG['num_actions']),
-            nn.Softmax(dim=1)
+            nn.Sigmoid()
+        )
+        return model
+    @staticmethod
+    def _build_dynamic_model():
+        hidden = RL_CONFIG['hidden_dim']
+        model = nn.Sequential(
+            nn.Linear(constants.OBSERVATION_DIMENSION+1, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, constants.OBSERVATION_DIMENSION+1),
         )
         return model
     def select_action(self, obs, raw=False):
         """Select action using epsilon-greedy policy"""
-        if np.random.rand() <= self.epsilon:
-            return random.randrange(RL_CONFIG['num_actions'])
-        
         obs = torch.FloatTensor(obs).unsqueeze(0)
+        self.q_network.eval()
         with torch.no_grad():
             q_values = self.q_network(obs)
         if raw:
             return q_values
-        return q_values.argmax().item()
+        # print(q_values)
+        det = np.random.rand()
+        if det > self.epsilon:
+            return q_values.argmax().item()
+        index = int(q_values.shape[1] * (self.epsilon-det)/self.epsilon)
+        _, indices = torch.sort(q_values[0])
+        return indices[index].item()
     def decay_epsilon(self):
         """Decay exploration rate"""
         if self.epsilon > RL_CONFIG['epsilon_min']:
             self.epsilon *= RL_CONFIG['epsilon_decay']
 
-    def update(self):
+    def update(self, epochs=30):
         if not self.epsilon:
             self.epsilon = RL_CONFIG['epsilon']
-        for _ in range(10):
+        self.q_network.train()
+        for _ in range(epochs):
             obs, actions, next_obs, rewards, dones = self.replay_sample()
             current_q_values = self.q_network(obs).gather(1, actions.unsqueeze(1)).squeeze(1)
             # Compute target Q values
@@ -117,8 +107,8 @@ class DQN_Learning(RLAlgorithm):
                 target_q_values = rewards + (1 - dones) * RL_CONFIG['gamma'] * next_q_values
             
             # Compute loss and update weights
-            loss = self.criterion(current_q_values, target_q_values)
             self.optimizer.zero_grad()
+            loss = self.criterion(current_q_values, target_q_values)
             loss.backward()
             # Gradient clipping to prevent exploding gradients
             torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), max_norm=1.0)
@@ -131,6 +121,28 @@ class DQN_Learning(RLAlgorithm):
         if episodes % RL_CONFIG['target_update_freq'] == 0:
             self.target_network.load_state_dict(self.q_network.state_dict())
     
+    def behavior_cloning(self, epochs=800):
+        observations, actions = tuple(torch.stack(t) for t in zip(*self.demo_buffer))
+        dataset = torch.utils.data.TensorDataset(observations, actions)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=RL_CONFIG['batch_size'], shuffle=True)
+        self.q_network.train()
+        for epoch in range(epochs):
+            for batch_obs, batch_actions in loader:
+                q_values = self.q_network(batch_obs)
+                demo = torch.zeros_like(q_values)
+                demo.scatter_(1, batch_actions.reshape(-1,1), 1.0)
+                self.optimizer.zero_grad()
+                loss = nn.CrossEntropyLoss()(q_values, demo)
+                loss.backward()
+                self.optimizer.step()
+    
+    def offline_training(self, epochs):
+        print("Extra training")
+        for epoch in range(epochs):
+            self.update(200)
+            self.update_target_network(0)
+        self.epsilon = 0
+
 # The Robot class (which could be called "Agent") is the "brain" of the robot, and is used to decide what action to execute in the environment
 class Robot:
     # Initialise a new robot
@@ -144,7 +156,7 @@ class Robot:
         self.brain = DQN_Learning()
         self.done = 0
         self.episode_steps = 0
-        self.demo_required = True
+        self.demo_required = 3
     
     @staticmethod
     def action_to_vector(action):
@@ -162,17 +174,20 @@ class Robot:
 
     # Get the next training action
     def training_action(self, obs, money):
-        if self.episode_steps > 800 or self.done:
+        if self.episode_steps == 0 and money < 15:
+            # Extra training using model prediction
+            self.brain.offline_training(50)
+            return 4, np.zeros(2)
+            
+        elif self.episode_steps > 800 or self.done:
             # Episode done, reset or end
-            action_type = 2 if money > 20 else 4
-            print("Action type:", action_type)
-            self.brain.epsilon = RL_CONFIG['epsilon']
             self.episode_steps = 0
+            self.brain.epsilon = 0
             self.prev_state = None
             self.prev_reward = None
             reset_state = np.array([0.05,np.random.uniform(0, constants.ENVIRONMENT_HEIGHT)])
             self.done = 0
-            return action_type, reset_state
+            return 2, reset_state
         
         action_value = []
         if self.demo_required:
@@ -190,6 +205,8 @@ class Robot:
     # Get the next testing action
     def testing_action(self, obs):
         # Random action
+        self.brain.replay_buffer.clear()
+        self.brain.demo_buffer.clear()
         if len(self.brain.replay_buffer) > RL_CONFIG['batch_size']:
             self.brain.update()
         action = self.brain.select_action(obs)
@@ -219,7 +236,7 @@ class Robot:
             shaped_reward += 100
         self.episode_steps += 1
         if self.prev_reward is not None and abs( reward - self.prev_reward ) < 1e-4:
-            shaped_reward -= 5
+            shaped_reward -= 12
         else:
             for checkpoint in np.arange(-1.8, 0, -0.2):
                 if reward > checkpoint:
@@ -239,7 +256,7 @@ class Robot:
         ])
         print("Demo received", len(demo), len(self.brain.demo_buffer))
         self.brain.behavior_cloning()
-        self.demo_required = False     
+        self.demo_required -= 1     
 
 
 if __name__ == "__main__":
